@@ -1,0 +1,16 @@
+<Project Sdk="Aspire.AppHost.Sdk/13.6.5">
+
+    <PropertyGroup>
+        <OutputType>Exe</OutputType>
+        <TargetFramework>net11.0</TargetFramework>
+        <ImplicitUsings>enable</ImplicitUsings>
+        <Nullable>enable</Nullable>
+        <AspireUseCliBundle>true</AspireUseCliBundle>
+        <UserSecretsId>b2ce27a3-0265-42ed-aada-55a6b624cd81</UserSecretsId>
+    </PropertyGroup>
+
+    <ItemGroup>
+        <ProjectReference Include="..\Accendit.Blazor\Accendit.Blazor.csproj" />
+    </ItemGroup>
+
+</Project>

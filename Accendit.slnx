@@ -1,0 +1,4 @@
+<Solution>
+  <Project Path="src/Accendit.AppHost/Accendit.AppHost.csproj" />
+  <Project Path="src/Accendit.Blazor/Accendit.Blazor.csproj" />
+</Solution>

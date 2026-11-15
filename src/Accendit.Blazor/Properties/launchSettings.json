@@ -1,0 +1,23 @@
+{
+  "$schema": "https://json.schemastore.org/launchsettings.json",
+    "profiles": {
+      "http": {
+        "commandName": "Project",
+        "dotnetRunMessages": true,
+        "launchBrowser": true,
+        "applicationUrl": "http://accendit-blazor.dev.localhost:5102",
+        "environmentVariables": {
+          "ASPNETCORE_ENVIRONMENT": "Development"
+        }
+      },
+      "https": {
+        "commandName": "Project",
+        "dotnetRunMessages": true,
+        "launchBrowser": true,
+        "applicationUrl": "https://accendit-blazor.dev.localhost:7074;http://accendit-blazor.dev.localhost:5102",
+        "environmentVariables": {
+          "ASPNETCORE_ENVIRONMENT": "Development"
+        }
+      }
+    }
+  }

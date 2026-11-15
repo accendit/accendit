@@ -1,0 +1,236 @@
+@page "/c/{CommunityName}/{TopicId:long}/comments/{CommentId:long}"
+@rendermode InteractiveServer
+@implements IAsyncDisposable
+
+@using Accendit.Blazor.Data
+@using Accendit.Blazor.Services
+@using Microsoft.EntityFrameworkCore
+@using Microsoft.JSInterop
+
+@inject ApplicationDbContext Db
+@inject CommunityAuthorizationService Authorization
+@inject NavigationManager Navigation
+@inject LitInterop Lit
+@inject ISnowflakeIdGenerator IdGenerator
+
+<PageTitle>Comment</PageTitle>
+
+<div @ref="_host">
+    <acc-comment-view></acc-comment-view>
+</div>
+
+@code {
+    [Parameter] public string CommunityName { get; set; } = string.Empty;
+    [Parameter] public long TopicId { get; set; }
+    [Parameter] public long CommentId { get; set; }
+
+    private ElementReference _host;
+    private DotNetObjectReference<object>? _dotNetRef;
+    private bool _dataReady;
+    private Community? _community;
+    private Topic? _topic;
+    private TopicComment? _comment;
+    private List<TopicComment> _replies = [];
+    private bool _notFound;
+    private string? _currentUserId;
+    private bool _canEdit;
+    private bool _canDelete;
+    private bool _editing;
+    private string _editContent = string.Empty;
+    private string _replyContent = string.Empty;
+
+    [CascadingParameter] private Task<AuthenticationState> AuthenticationStateTask { get; set; } = null!;
+
+    protected override async Task OnParametersSetAsync()
+    {
+        _dataReady = false;
+        _notFound = false;
+        if (!CommunityNameNormalizer.TryNormalize(CommunityName, out var normalized))
+        {
+            _notFound = true;
+            _dataReady = true;
+            return;
+        }
+
+        _community = await Db.Communities.AsNoTracking().FirstOrDefaultAsync(c => c.Name == normalized);
+        if (_community is null)
+        {
+            _notFound = true;
+            _dataReady = true;
+            return;
+        }
+
+        _topic = await Db.Topics.AsNoTracking()
+            .FirstOrDefaultAsync(t => t.Id == TopicId && t.CommunityId == _community.Id);
+        if (_topic is null)
+        {
+            _notFound = true;
+            _dataReady = true;
+            return;
+        }
+
+        _comment = await Db.TopicComments.AsNoTracking()
+            .Include(c => c.Author)
+            .FirstOrDefaultAsync(c => c.Id == CommentId && c.TopicId == TopicId);
+        if (_comment is null)
+        {
+            _notFound = true;
+            _dataReady = true;
+            return;
+        }
+
+        await LoadRepliesAsync();
+
+        var authState = await AuthenticationStateTask;
+        _currentUserId = authState.User.FindFirst(System.Security.Claims.ClaimTypes.NameIdentifier)?.Value;
+        _canEdit = await Authorization.CanModifyCommentAsync(_comment, _currentUserId);
+        _canDelete = await Authorization.CanDeleteCommentAsync(_comment, _currentUserId);
+        _dataReady = true;
+    }
+
+    protected override async Task OnAfterRenderAsync(bool firstRender)
+    {
+        if (!_dataReady)
+        {
+            return;
+        }
+
+        if (!_dataReady)
+        {
+            return;
+        }
+
+        _dotNetRef ??= DotNetObjectReference.Create<object>(this);
+        await Lit.SyncAsync("syncCommentView", _host, _dotNetRef, BuildState());
+    }
+
+    [JSInvokable]
+    public async Task OnLitAction(string action, string? value)
+    {
+        switch (action)
+        {
+            case "start-edit":
+                _editing = true;
+                _editContent = _comment?.Content ?? string.Empty;
+                break;
+            case "cancel-edit":
+                _editing = false;
+                break;
+            case "edit-input":
+                _editContent = value ?? string.Empty;
+                return;
+            case "save-comment":
+                await SaveAsync();
+                break;
+            case "delete-comment":
+                await DeleteAsync();
+                return;
+            case "reply-input":
+                _replyContent = value ?? string.Empty;
+                return;
+            case "post-reply":
+                await AddReplyAsync();
+                break;
+        }
+
+        await InvokeAsync(StateHasChanged);
+    }
+
+    private object BuildState() => new
+    {
+        notFound = _notFound,
+        communityName = _community?.Name,
+        topicId = TopicId.ToString(System.Globalization.CultureInfo.InvariantCulture),
+        topicTitle = _topic?.Title,
+        content = _comment?.Content,
+        authorUserName = _comment?.Author.UserName,
+        createdAt = _comment?.CreatedAt.LocalDateTime.ToString("g", System.Globalization.CultureInfo.CurrentCulture),
+        canEdit = _canEdit,
+        canDelete = _canDelete,
+        editing = _editing,
+        editContent = _editContent,
+        isSignedIn = _currentUserId is not null,
+        replyContent = _replyContent,
+        replies = _replies.Select(r => new
+        {
+            id = r.Id.ToString(System.Globalization.CultureInfo.InvariantCulture),
+            content = r.Content,
+            authorUserName = r.Author.UserName ?? "unknown",
+            createdAt = r.CreatedAt.LocalDateTime.ToString("g", System.Globalization.CultureInfo.CurrentCulture),
+            canEdit = false,
+            canDelete = false,
+            replies = Array.Empty<object>()
+        }).ToList()
+    };
+
+    private async Task LoadRepliesAsync()
+    {
+        _replies = await Db.TopicComments.AsNoTracking()
+            .Include(c => c.Author)
+            .Where(c => c.ParentCommentId == CommentId)
+            .OrderByDescending(c => c.CreatedAt)
+            .ToListAsync();
+    }
+
+    private async Task SaveAsync()
+    {
+        if (_comment is null) return;
+
+        var tracked = await Db.TopicComments.FirstOrDefaultAsync(c => c.Id == _comment.Id);
+        if (tracked is null) return;
+
+        if (!await Authorization.CanModifyCommentAsync(tracked, _currentUserId))
+        {
+            return;
+        }
+
+        tracked.Content = _editContent.Trim();
+        tracked.UpdatedAt = DateTimeOffset.UtcNow;
+        await Db.SaveChangesAsync();
+        _comment.Content = tracked.Content;
+        _editing = false;
+    }
+
+    private async Task DeleteAsync()
+    {
+        if (_comment is null) return;
+
+        var tracked = await Db.TopicComments.FirstOrDefaultAsync(c => c.Id == _comment.Id);
+        if (tracked is null) return;
+
+        if (!await Authorization.CanDeleteCommentAsync(tracked, _currentUserId))
+        {
+            return;
+        }
+
+        Db.TopicComments.Remove(tracked);
+        await Db.SaveChangesAsync();
+        Navigation.NavigateTo($"/c/{_community!.Name}/topics/{TopicId}");
+    }
+
+    private async Task AddReplyAsync()
+    {
+        if (_currentUserId is null || string.IsNullOrWhiteSpace(_replyContent)) return;
+
+        var reply = new TopicComment
+        {
+            Id = IdGenerator.NextId(),
+            TopicId = TopicId,
+            ParentCommentId = CommentId,
+            AuthorId = _currentUserId,
+            Content = _replyContent.Trim(),
+            CreatedAt = DateTimeOffset.UtcNow
+        };
+
+        Db.TopicComments.Add(reply);
+        await Db.SaveChangesAsync();
+        _replyContent = string.Empty;
+        await LoadRepliesAsync();
+    }
+
+    public ValueTask DisposeAsync()
+    {
+        _dotNetRef?.Dispose();
+        return ValueTask.CompletedTask;
+    }
+}

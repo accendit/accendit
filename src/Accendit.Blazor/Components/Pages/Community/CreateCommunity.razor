@@ -1,0 +1,116 @@
+@page "/c/create"
+@attribute [Microsoft.AspNetCore.Authorization.Authorize]
+@rendermode InteractiveServer
+@implements IAsyncDisposable
+
+@using Accendit.Blazor.Data
+@using Accendit.Blazor.Services
+@using Microsoft.AspNetCore.Identity
+@using Microsoft.EntityFrameworkCore
+@using Microsoft.JSInterop
+
+@inject ApplicationDbContext Db
+@inject UserManager<ApplicationUser> UserManager
+@inject NavigationManager Navigation
+@inject LitInterop Lit
+@inject ISnowflakeIdGenerator IdGenerator
+
+<PageTitle>Create community</PageTitle>
+
+<div @ref="_host">
+    <acc-create-community-view></acc-create-community-view>
+</div>
+
+@code {
+    private ElementReference _host;
+    private DotNetObjectReference<object>? _dotNetRef;
+    private string _name = string.Empty;
+    private string _description = string.Empty;
+    private string? _error;
+
+    [CascadingParameter] private Task<AuthenticationState> AuthenticationStateTask { get; set; } = null!;
+
+    protected override async Task OnAfterRenderAsync(bool firstRender)
+    {
+        _dotNetRef ??= DotNetObjectReference.Create<object>(this);
+        await Lit.SyncAsync(
+            "syncCreateCommunityView",
+            _host,
+            _dotNetRef,
+            new { name = _name, description = _description, error = _error });
+    }
+
+    [JSInvokable]
+    public async Task OnLitAction(string action, string? value)
+    {
+        switch (action)
+        {
+            case "name":
+                _name = value ?? string.Empty;
+                return;
+            case "description":
+                _description = value ?? string.Empty;
+                return;
+            case "create":
+                await CreateAsync();
+                break;
+        }
+
+        await InvokeAsync(StateHasChanged);
+    }
+
+    private async Task CreateAsync()
+    {
+        _error = null;
+        if (!CommunityNameNormalizer.TryNormalize(_name, out var normalized))
+        {
+            _error = "Name must be 1–64 lowercase letters, numbers, or hyphens (not at the start or end).";
+            return;
+        }
+
+        if (await Db.Communities.AnyAsync(c => c.Name == normalized))
+        {
+            _error = "That community name is already taken.";
+            return;
+        }
+
+        var user = await UserManager.GetUserAsync((await AuthenticationStateTask).User);
+        if (user is null)
+        {
+            _error = "You must be signed in.";
+            return;
+        }
+
+        if (!await UserManager.IsInRoleAsync(user, ApplicationRoleNames.Member))
+        {
+            await UserManager.AddToRoleAsync(user, ApplicationRoleNames.Member);
+        }
+
+        var community = new Community
+        {
+            Id = IdGenerator.NextId(),
+            Name = normalized,
+            Description = _description.Trim(),
+            CreatedAt = DateTimeOffset.UtcNow
+        };
+
+        Db.Communities.Add(community);
+        Db.CommunityMemberships.Add(new CommunityMembership
+        {
+            Id = IdGenerator.NextId(),
+            CommunityId = community.Id,
+            UserId = user.Id,
+            Role = CommunityRole.Owner,
+            JoinedAt = DateTimeOffset.UtcNow
+        });
+
+        await Db.SaveChangesAsync();
+        Navigation.NavigateTo($"/c/{community.Name}");
+    }
+
+    public ValueTask DisposeAsync()
+    {
+        _dotNetRef?.Dispose();
+        return ValueTask.CompletedTask;
+    }
+}

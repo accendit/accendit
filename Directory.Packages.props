@@ -1,0 +1,22 @@
+<Project>
+  <PropertyGroup>
+    <ManagePackageVersionsCentrally>true</ManagePackageVersionsCentrally>
+    <CentralPackageTransitivePinningEnabled>true</CentralPackageTransitivePinningEnabled>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <GlobalPackageReference Include="Dagger.Analyzers" Version="0.1.2" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Update="Aspire.Hosting.AppHost" Version="13.6.5" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageVersion Include="Microsoft.AspNetCore.Diagnostics.EntityFrameworkCore" Version="11.0.0" />
+    <PackageVersion Include="Microsoft.AspNetCore.Identity.EntityFrameworkCore" Version="11.0.0" />
+    <PackageVersion Include="Microsoft.EntityFrameworkCore.Design" Version="11.0.0" />
+    <PackageVersion Include="Microsoft.EntityFrameworkCore.Sqlite" Version="11.0.0" />
+    <PackageVersion Include="Microsoft.EntityFrameworkCore.Tools" Version="11.0.0" />
+  </ItemGroup>
+</Project>

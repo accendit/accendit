@@ -1,0 +1,248 @@
+@page "/c/{CommunityName}"
+@rendermode InteractiveServer
+@implements IAsyncDisposable
+
+@using System.ComponentModel.DataAnnotations
+@using Accendit.Blazor.Data
+@using Accendit.Blazor.Services
+@using Microsoft.AspNetCore.Identity
+@using Microsoft.EntityFrameworkCore
+@using Microsoft.JSInterop
+
+@inject ApplicationDbContext Db
+@inject UserManager<ApplicationUser> UserManager
+@inject CommunityAuthorizationService Authorization
+@inject NavigationManager Navigation
+@inject LitInterop Lit
+@inject ISnowflakeIdGenerator IdGenerator
+
+<PageTitle>@(_community?.Name ?? CommunityName)</PageTitle>
+
+<div @ref="_host">
+    <acc-community-view></acc-community-view>
+</div>
+
+@code {
+    [Parameter] public string CommunityName { get; set; } = string.Empty;
+
+    private ElementReference _host;
+    private DotNetObjectReference<object>? _dotNetRef;
+    private Community? _community;
+    private List<Topic> _topics = [];
+    private bool _loaded;
+    private string? _currentUserId;
+    private CommunityRole? _membershipRole;
+    private readonly NewTopicInput _newTopic = new();
+    private string? _topicError;
+    private string _moderatorEmail = string.Empty;
+    private string? _moderatorMessage;
+
+    [CascadingParameter] private Task<AuthenticationState> AuthenticationStateTask { get; set; } = null!;
+
+    protected override async Task OnParametersSetAsync()
+    {
+        _loaded = false;
+        if (!CommunityNameNormalizer.TryNormalize(CommunityName, out var normalized))
+        {
+            _community = null;
+            _loaded = true;
+            return;
+        }
+
+        _community = await Db.Communities.AsNoTracking().FirstOrDefaultAsync(c => c.Name == normalized);
+        if (_community is null)
+        {
+            _loaded = true;
+            return;
+        }
+
+        _topics = await Db.Topics.AsNoTracking()
+            .Where(t => t.CommunityId == _community.Id)
+            .OrderByDescending(t => t.CreatedAt)
+            .ToListAsync();
+
+        var authState = await AuthenticationStateTask;
+        _currentUserId = authState.User.FindFirst(System.Security.Claims.ClaimTypes.NameIdentifier)?.Value;
+        _membershipRole = await Authorization.GetUserRoleAsync(_community.Id, _currentUserId);
+
+        _loaded = true;
+    }
+
+    protected override async Task OnAfterRenderAsync(bool firstRender)
+    {
+        if (!_loaded)
+        {
+            return;
+        }
+
+        _dotNetRef ??= DotNetObjectReference.Create<object>(this);
+        await Lit.SyncAsync("syncCommunityView", _host, _dotNetRef, BuildState());
+    }
+
+    [JSInvokable]
+    public async Task OnLitAction(string action, string? value)
+    {
+        switch (action)
+        {
+            case "follow":
+                await FollowAsync();
+                break;
+            case "unfollow":
+                await UnfollowAsync();
+                break;
+            case "moderator-email":
+                _moderatorEmail = value ?? string.Empty;
+                return;
+            case "add-moderator":
+                await AddModeratorAsync();
+                break;
+            case "topic-title":
+                _newTopic.Title = value ?? string.Empty;
+                return;
+            case "topic-content":
+                _newTopic.Content = value ?? string.Empty;
+                return;
+            case "create-topic":
+                await CreateTopicAsync();
+                break;
+        }
+
+        await InvokeAsync(StateHasChanged);
+    }
+
+    private object BuildState() => new
+    {
+        loaded = _loaded,
+        notFound = _loaded && _community is null,
+        name = _community?.Name,
+        description = _community?.Description,
+        isSignedIn = _currentUserId is not null,
+        membershipRole = _membershipRole?.ToString(),
+        moderatorEmail = _moderatorEmail,
+        moderatorMessage = _moderatorMessage,
+        topics = _topics.Select(CommunityLitMapper.ToTopicListItem).ToList(),
+        newTopicTitle = _newTopic.Title,
+        newTopicContent = _newTopic.Content,
+        topicError = _topicError
+    };
+
+    private async Task FollowAsync()
+    {
+        if (_community is null || _currentUserId is null) return;
+
+        var exists = await Db.CommunityMemberships.AnyAsync(m => m.CommunityId == _community.Id && m.UserId == _currentUserId);
+        if (exists) return;
+
+        Db.CommunityMemberships.Add(new CommunityMembership
+        {
+            Id = IdGenerator.NextId(),
+            CommunityId = _community.Id,
+            UserId = _currentUserId,
+            Role = CommunityRole.Follower,
+            JoinedAt = DateTimeOffset.UtcNow
+        });
+        await Db.SaveChangesAsync();
+        _membershipRole = CommunityRole.Follower;
+    }
+
+    private async Task UnfollowAsync()
+    {
+        if (_community is null || _currentUserId is null) return;
+
+        var membership = await Db.CommunityMemberships
+            .FirstOrDefaultAsync(m => m.CommunityId == _community.Id && m.UserId == _currentUserId && m.Role == CommunityRole.Follower);
+        if (membership is null) return;
+
+        Db.CommunityMemberships.Remove(membership);
+        await Db.SaveChangesAsync();
+        _membershipRole = null;
+    }
+
+    private async Task AddModeratorAsync()
+    {
+        _moderatorMessage = null;
+        if (_community is null || _currentUserId is null) return;
+
+        var user = await UserManager.FindByEmailAsync(_moderatorEmail.Trim());
+        if (user is null)
+        {
+            _moderatorMessage = "No user with that email.";
+            return;
+        }
+
+        if (string.Equals(user.Id, _currentUserId, StringComparison.Ordinal))
+        {
+            _moderatorMessage = "You are already the owner.";
+            return;
+        }
+
+        var membership = await Db.CommunityMemberships
+            .FirstOrDefaultAsync(m => m.CommunityId == _community.Id && m.UserId == user.Id);
+        if (membership is not null)
+        {
+            membership.Role = CommunityRole.Moderator;
+        }
+        else
+        {
+            Db.CommunityMemberships.Add(new CommunityMembership
+            {
+                Id = IdGenerator.NextId(),
+                CommunityId = _community.Id,
+                UserId = user.Id,
+                Role = CommunityRole.Moderator,
+                JoinedAt = DateTimeOffset.UtcNow
+            });
+        }
+
+        await Db.SaveChangesAsync();
+        _moderatorEmail = string.Empty;
+        _moderatorMessage = $"{user.UserName} is now a moderator.";
+    }
+
+    private async Task CreateTopicAsync()
+    {
+        _topicError = null;
+        if (_community is null || _currentUserId is null) return;
+
+        if (string.IsNullOrWhiteSpace(_newTopic.Content))
+        {
+            _topicError = "Content is required.";
+            return;
+        }
+
+        if (string.IsNullOrWhiteSpace(_newTopic.Title) || _newTopic.Title.Length > 50)
+        {
+            _topicError = "Title must be 1–50 characters.";
+            return;
+        }
+
+        var topic = new Topic
+        {
+            Id = IdGenerator.NextId(),
+            CommunityId = _community.Id,
+            AuthorId = _currentUserId,
+            Title = _newTopic.Title.Trim(),
+            Content = _newTopic.Content.Trim(),
+            CreatedAt = DateTimeOffset.UtcNow
+        };
+
+        Db.Topics.Add(topic);
+        await Db.SaveChangesAsync();
+        Navigation.NavigateTo($"/c/{_community.Name}/topics/{topic.Id}");
+    }
+
+    public ValueTask DisposeAsync()
+    {
+        _dotNetRef?.Dispose();
+        return ValueTask.CompletedTask;
+    }
+
+    private sealed class NewTopicInput
+    {
+        [Required]
+        [StringLength(50, MinimumLength = 1)]
+        public string Title { get; set; } = string.Empty;
+
+        public string Content { get; set; } = string.Empty;
+    }
+}

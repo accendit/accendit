@@ -1,0 +1,337 @@
+@page "/c/{CommunityName}/topics/{TopicId:long}"
+@rendermode InteractiveServer
+@implements IAsyncDisposable
+
+@using Accendit.Blazor.Data
+@using Accendit.Blazor.Services
+@using Microsoft.EntityFrameworkCore
+@using Microsoft.JSInterop
+
+@inject ApplicationDbContext Db
+@inject CommunityAuthorizationService Authorization
+@inject NavigationManager Navigation
+@inject LitInterop Lit
+@inject ISnowflakeIdGenerator IdGenerator
+
+<PageTitle>@(_topic?.Title ?? "Topic")</PageTitle>
+
+<div @ref="_host">
+    <acc-topic-view></acc-topic-view>
+</div>
+
+@code {
+    [Parameter] public string CommunityName { get; set; } = string.Empty;
+    [Parameter] public long TopicId { get; set; }
+
+    private ElementReference _host;
+    private DotNetObjectReference<object>? _dotNetRef;
+    private bool _dataReady;
+    private Community? _community;
+    private Topic? _topic;
+    private List<TopicComment> _rootComments = [];
+    private bool _notFound;
+    private string? _currentUserId;
+    private bool _canModifyTopic;
+    private bool _editing;
+    private string? _editingCommentId;
+    private string? _replyToId;
+    private string _newComment = string.Empty;
+    private string _editTitle = string.Empty;
+    private string _editContent = string.Empty;
+    private string _editCommentContent = string.Empty;
+    private Dictionary<long, bool> _deletePermissions = [];
+    private Dictionary<long, bool> _editPermissions = [];
+
+    [CascadingParameter] private Task<AuthenticationState> AuthenticationStateTask { get; set; } = null!;
+
+    protected override async Task OnParametersSetAsync()
+    {
+        _dataReady = false;
+        _notFound = false;
+        if (!CommunityNameNormalizer.TryNormalize(CommunityName, out var normalized))
+        {
+            _notFound = true;
+            _dataReady = true;
+            return;
+        }
+
+        _community = await Db.Communities.AsNoTracking().FirstOrDefaultAsync(c => c.Name == normalized);
+        if (_community is null)
+        {
+            _notFound = true;
+            _dataReady = true;
+            return;
+        }
+
+        _topic = await Db.Topics.AsNoTracking()
+            .FirstOrDefaultAsync(t => t.Id == TopicId && t.CommunityId == _community.Id);
+        if (_topic is null)
+        {
+            _notFound = true;
+            _dataReady = true;
+            return;
+        }
+
+        var authState = await AuthenticationStateTask;
+        _currentUserId = authState.User.FindFirst(System.Security.Claims.ClaimTypes.NameIdentifier)?.Value;
+        _canModifyTopic = await Authorization.CanModifyTopicAsync(_topic, _currentUserId);
+
+        await LoadCommentsAsync();
+        _dataReady = true;
+    }
+
+    protected override async Task OnAfterRenderAsync(bool firstRender)
+    {
+        if (!_dataReady)
+        {
+            return;
+        }
+
+        _dotNetRef ??= DotNetObjectReference.Create<object>(this);
+        await Lit.SyncAsync("syncTopicView", _host, _dotNetRef, BuildState());
+    }
+
+    [JSInvokable]
+    public async Task OnLitAction(string action, string? value)
+    {
+        switch (action)
+        {
+            case "start-edit":
+                StartEdit();
+                break;
+            case "cancel-edit":
+                _editing = false;
+                break;
+            case "edit-title":
+                _editTitle = value ?? string.Empty;
+                return;
+            case "edit-content":
+                _editContent = value ?? string.Empty;
+                return;
+            case "save-topic":
+                await SaveTopicAsync();
+                break;
+            case "delete-topic":
+                await DeleteTopicAsync();
+                return;
+            case "comment-input":
+                _newComment = value ?? string.Empty;
+                return;
+            case "post-comment":
+                await AddCommentAsync();
+                break;
+            case "cancel-reply":
+                _replyToId = null;
+                break;
+            case "reply":
+                _replyToId = value;
+                break;
+            case "edit":
+                await StartCommentEditAsync(value);
+                break;
+            case "delete":
+                await DeleteCommentAsync(value);
+                break;
+            case "edit-comment-input":
+                _editCommentContent = value ?? string.Empty;
+                return;
+            case "save-comment":
+                await SaveCommentAsync();
+                break;
+            case "cancel-comment-edit":
+                _editingCommentId = null;
+                break;
+        }
+
+        await InvokeAsync(StateHasChanged);
+    }
+
+    private object BuildState() => new
+    {
+        notFound = _notFound,
+        communityName = _community?.Name,
+        topicId = TopicId.ToString(System.Globalization.CultureInfo.InvariantCulture),
+        title = _topic?.Title,
+        content = _topic?.Content,
+        canModifyTopic = _canModifyTopic,
+        editing = _editing,
+        editTitle = _editTitle,
+        editContent = _editContent,
+        isSignedIn = _currentUserId is not null,
+        replyToId = _replyToId,
+        newComment = _newComment,
+        editingCommentId = _editingCommentId,
+        editCommentContent = _editCommentContent,
+        comments = _rootComments.Select(c => CommunityLitMapper.ToCommentNode(c, _editPermissions, _deletePermissions)).ToList()
+    };
+
+    private async Task LoadCommentsAsync()
+    {
+        if (_topic is null) return;
+
+        var all = await Db.TopicComments.AsNoTracking()
+            .Include(c => c.Author)
+            .Where(c => c.TopicId == _topic.Id)
+            .OrderByDescending(c => c.CreatedAt)
+            .ToListAsync();
+
+        _deletePermissions = [];
+        _editPermissions = [];
+        foreach (var comment in all)
+        {
+            _deletePermissions[comment.Id] = await Authorization.CanDeleteCommentAsync(comment, _currentUserId);
+            _editPermissions[comment.Id] = await Authorization.CanModifyCommentAsync(comment, _currentUserId);
+        }
+
+        var lookup = all.ToDictionary(c => c.Id);
+        foreach (var comment in all)
+        {
+            comment.Replies = [];
+        }
+
+        var roots = new List<TopicComment>();
+        foreach (var comment in all)
+        {
+            if (comment.ParentCommentId is null)
+            {
+                roots.Add(comment);
+            }
+            else if (lookup.TryGetValue(comment.ParentCommentId.Value, out var parent))
+            {
+                parent.Replies.Add(comment);
+            }
+        }
+
+        SortRepliesRecursively(roots);
+        _rootComments = roots;
+    }
+
+    private static void SortRepliesRecursively(List<TopicComment> comments)
+    {
+        comments.Sort((a, b) => b.CreatedAt.CompareTo(a.CreatedAt));
+        foreach (var comment in comments)
+        {
+            if (comment.Replies.Count > 0)
+            {
+                var sorted = comment.Replies.OrderByDescending(r => r.CreatedAt).ToList();
+                comment.Replies = sorted;
+                SortRepliesRecursively(sorted);
+            }
+        }
+    }
+
+    private void StartEdit()
+    {
+        if (_topic is null) return;
+        _editTitle = _topic.Title;
+        _editContent = _topic.Content;
+        _editing = true;
+    }
+
+    private async Task SaveTopicAsync()
+    {
+        if (_topic is null || !_canModifyTopic) return;
+
+        var tracked = await Db.Topics.FirstOrDefaultAsync(t => t.Id == _topic.Id);
+        if (tracked is null) return;
+
+        tracked.Title = _editTitle.Trim();
+        tracked.Content = _editContent.Trim();
+        tracked.UpdatedAt = DateTimeOffset.UtcNow;
+        await Db.SaveChangesAsync();
+        _topic = tracked;
+        _editing = false;
+    }
+
+    private async Task DeleteTopicAsync()
+    {
+        if (_topic is null || !_canModifyTopic) return;
+
+        var tracked = await Db.Topics.FirstOrDefaultAsync(t => t.Id == _topic.Id);
+        if (tracked is null) return;
+
+        Db.Topics.Remove(tracked);
+        await Db.SaveChangesAsync();
+        Navigation.NavigateTo($"/c/{_community!.Name}");
+    }
+
+    private async Task AddCommentAsync()
+    {
+        if (_topic is null || _currentUserId is null || string.IsNullOrWhiteSpace(_newComment)) return;
+
+        long? parentId = null;
+        if (!string.IsNullOrEmpty(_replyToId) && SnowflakeIdParser.TryParse(_replyToId, out var parsed))
+        {
+            parentId = parsed;
+        }
+
+        var comment = new TopicComment
+        {
+            Id = IdGenerator.NextId(),
+            TopicId = _topic.Id,
+            ParentCommentId = parentId,
+            AuthorId = _currentUserId,
+            Content = _newComment.Trim(),
+            CreatedAt = DateTimeOffset.UtcNow
+        };
+
+        Db.TopicComments.Add(comment);
+        await Db.SaveChangesAsync();
+        _newComment = string.Empty;
+        _replyToId = null;
+        await LoadCommentsAsync();
+    }
+
+    private async Task StartCommentEditAsync(string? commentId)
+    {
+        if (!SnowflakeIdParser.TryParse(commentId, out var id)) return;
+
+        var comment = await Db.TopicComments.AsNoTracking().FirstOrDefaultAsync(c => c.Id == id);
+        if (comment is null) return;
+
+        _editingCommentId = commentId;
+        _editCommentContent = comment.Content;
+    }
+
+    private async Task SaveCommentAsync()
+    {
+        if (!SnowflakeIdParser.TryParse(_editingCommentId, out var id)) return;
+
+        var tracked = await Db.TopicComments.FirstOrDefaultAsync(c => c.Id == id);
+        if (tracked is null) return;
+
+        if (!await Authorization.CanModifyCommentAsync(tracked, _currentUserId))
+        {
+            return;
+        }
+
+        tracked.Content = _editCommentContent.Trim();
+        tracked.UpdatedAt = DateTimeOffset.UtcNow;
+        await Db.SaveChangesAsync();
+        _editingCommentId = null;
+        await LoadCommentsAsync();
+    }
+
+    private async Task DeleteCommentAsync(string? commentId)
+    {
+        if (!SnowflakeIdParser.TryParse(commentId, out var id)) return;
+
+        var tracked = await Db.TopicComments.FirstOrDefaultAsync(c => c.Id == id);
+        if (tracked is null) return;
+
+        if (!await Authorization.CanDeleteCommentAsync(tracked, _currentUserId))
+        {
+            return;
+        }
+
+        Db.TopicComments.Remove(tracked);
+        await Db.SaveChangesAsync();
+        await LoadCommentsAsync();
+    }
+
+    public ValueTask DisposeAsync()
+    {
+        _dotNetRef?.Dispose();
+        return ValueTask.CompletedTask;
+    }
+}
